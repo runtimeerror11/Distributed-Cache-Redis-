@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+.vscode/
+.idea/
+*.o
+*.a
+*.so
+*.log
+compile_commands.json
+results/*.csv
+results/*.png
+!results/.gitkeep
