@@ -1,25 +1,59 @@
-// coordinator: tracks membership via heartbeats, decides failover, and publishes the
-// cluster view (with a new epoch) whenever a node fails or joins.
-// Usage: coordinator --port 7000
+// coordinator: owns the cluster map and serves it to nodes and clients.
+// Usage: coordinator --config config/cluster.conf [--port 7000]
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <string>
 
-#include "distcache/cluster/membership.h"
-#include "distcache/cluster/ownership.h"
+#include "distcache/common/log.h"
+#include "distcache/server/coordinator.h"
 
 using namespace distcache;
 
-int main() {
-    Membership membership(std::chrono::milliseconds(1000), std::chrono::milliseconds(3000));
-    OwnershipTable ownership;
+static void usage() {
+    std::cerr << "usage: coordinator --config <file> [--port <port>]\n";
+}
 
-    membership.set_listener([&](const NodeId& node, NodeState state) {
-        // TODO(stage 4): on Dead -> promote the replica, bump epoch, broadcast new ClusterView.
-        // TODO(stage 5): on a new node joining -> bump epoch, trigger rebalancing.
-        (void)node;
-        (void)state;
-    });
+int main(int argc, char **argv) {
+    std::string config;
+    long port = 7000;
+    for (int i = 1; i < argc; i++) {
+        std::string flag = argv[i];
+        if (i + 1 >= argc) {
+            usage();
+            return 2;
+        }
+        std::string val = argv[++i];
+        if (flag == "--config") {
+            config = val;
+        } else if (flag == "--port") {
+            port = std::strtol(val.c_str(), nullptr, 10);
+        } else {
+            usage();
+            return 2;
+        }
+    }
+    if (config.empty() || port <= 0 || port > 65535) {
+        usage();
+        return 2;
+    }
 
-    std::cout << "coordinator: not implemented yet\n";
-    // TODO(stage 4): accept heartbeats over TCP and call membership.tick() periodically.
+    Topology topo;
+    std::string err;
+    if (!Topology::load_file(config, &topo, &err)) {
+        DC_LOG("coordinator: %s", err.c_str());
+        return 1;
+    }
+
+    EventServer::install_signal_handlers();
+    Coordinator coord(topo, uint16_t(port));
+    if (!coord.listen_now(&err)) {
+        DC_LOG("coordinator: %s", err.c_str());
+        return 1;
+    }
+    DC_LOG("coordinator listening on port %ld (epoch %llu, %zu shards)", port,
+           (unsigned long long)topo.epoch, topo.shards.size());
+    coord.run();
+    DC_LOG("coordinator stopped");
     return 0;
 }

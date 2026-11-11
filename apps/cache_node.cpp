@@ -1,41 +1,102 @@
-// cache_node: one shard of the distributed cache.
-// Usage: cache_node --id node-1 --port 7001 [--max-memory-mb 64] [--ack async|replica]
+// cache_node: the primary or the replica of one shard.
+//
+// Usage:
+//   cache_node --shard s1 --role primary|replica (--coord host:port | --config file)
+//              [--maxmemory-mb 64] [--idle-timeout-ms 300000]
+//
+// The node loads the cluster map (from the coordinator, or from a file), finds
+// its own shard and role in it, and listens on the port listed there.
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 
-#include "distcache/cluster/ownership.h"
-#include "distcache/replication/replicator.h"
-#include "distcache/server/command_handler.h"
-#include "distcache/server/tcp_server.h"
-#include "distcache/store/kv_store.h"
+#include "distcache/client/client.h"
+#include "distcache/common/log.h"
+#include "distcache/common/net.h"
+#include "distcache/server/cache_node.h"
 
 using namespace distcache;
 
-int main(int argc, char** argv) {
-    std::string id = "node-1";
-    std::uint16_t port = 7001;
-    std::size_t max_mb = 64;
-    AckPolicy ack = AckPolicy::Async;
+static void usage() {
+    std::cerr << "usage: cache_node --shard <id> --role primary|replica "
+                 "(--coord <host:port> | --config <file>)\n"
+                 "                  [--maxmemory-mb <n>] [--idle-timeout-ms <n>]\n";
+}
 
-    for (int i = 1; i + 1 < argc; i += 2) {
-        std::string flag = argv[i], val = argv[i + 1];
-        if (flag == "--id") id = val;
-        else if (flag == "--port") port = static_cast<std::uint16_t>(std::stoi(val));
-        else if (flag == "--max-memory-mb") max_mb = std::stoul(val);
-        else if (flag == "--ack") ack = (val == "replica") ? AckPolicy::WaitReplica : AckPolicy::Async;
+int main(int argc, char **argv) {
+    NodeOptions opts;
+    std::string coord, config, role;
+    for (int i = 1; i < argc; i++) {
+        std::string flag = argv[i];
+        if (i + 1 >= argc) {
+            usage();
+            return 2;
+        }
+        std::string val = argv[++i];
+        if (flag == "--shard") {
+            opts.shard_id = val;
+        } else if (flag == "--role") {
+            role = val;
+        } else if (flag == "--coord") {
+            coord = val;
+        } else if (flag == "--config") {
+            config = val;
+        } else if (flag == "--maxmemory-mb") {
+            opts.max_bytes = size_t(std::strtoull(val.c_str(), nullptr, 10)) << 20;
+        } else if (flag == "--idle-timeout-ms") {
+            opts.idle_timeout_ms = std::strtoull(val.c_str(), nullptr, 10);
+        } else {
+            usage();
+            return 2;
+        }
+    }
+    if (opts.shard_id.empty() || (role != "primary" && role != "replica") ||
+        coord.empty() == config.empty() || opts.max_bytes == 0) {
+        usage();
+        return 2;
+    }
+    opts.role = (role == "primary") ? Role::Primary : Role::Replica;
+
+    // Load the cluster map. From the coordinator, retry for a while in case it
+    // is still starting up.
+    Topology topo;
+    std::string err;
+    bool ok = false;
+    if (!config.empty()) {
+        ok = Topology::load_file(config, &topo, &err);
+    } else {
+        for (int attempt = 0; attempt < 50 && !ok; attempt++) {
+            ok = fetch_topology(coord, &topo, &err);
+            if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    if (!ok) {
+        DC_LOG("cache_node: cannot load cluster map: %s", err.c_str());
+        return 1;
     }
 
-    KvStore store(max_mb * 1024 * 1024);
-    OwnershipTable ownership;
-    Replicator replicator(ack, std::chrono::milliseconds(200));
-    CommandHandler handler(id, store, ownership, replicator);
+    const ShardInfo *shard = topo.find(opts.shard_id);
+    std::string addr = !shard ? "" : (opts.role == Role::Primary ? shard->primary : shard->replica);
+    std::string host;
+    uint16_t port = 0;
+    if (!shard || !parse_addr(addr, &host, &port)) {
+        DC_LOG("cache_node: no %s address for shard %s in the map", role.c_str(),
+               opts.shard_id.c_str());
+        return 1;
+    }
 
-    // TODO(stage 1): start periodic expiry thread calling store.sweep_expired(20) every 100 ms.
-    // TODO(stage 4): start heartbeat thread sending to the coordinator.
-
-    std::cout << "Starting " << id << " on port " << port << "\n";
-    TcpServer server(port, [&](const auto& args) { return handler.handle(args); });
-    server.run();
-    return EXIT_SUCCESS;
+    EventServer::install_signal_handlers();
+    CacheNode node(topo, opts, port);
+    if (!node.init(&err) || !node.listen_now(&err)) {
+        DC_LOG("cache_node: %s", err.c_str());
+        return 1;
+    }
+    DC_LOG("%s of shard %s listening on port %u (epoch %llu, maxmemory %zu MiB)", role.c_str(),
+           opts.shard_id.c_str(), unsigned(port), (unsigned long long)topo.epoch,
+           opts.max_bytes >> 20);
+    node.run();
+    DC_LOG("%s of shard %s stopped", role.c_str(), opts.shard_id.c_str());
+    return 0;
 }

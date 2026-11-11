@@ -3,11 +3,14 @@ on: [push, pull_request]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sanitize: [OFF, ON]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DDISTCACHE_SANITIZE=ON
+        run: cmake -S . -B build -DDISTCACHE_SANITIZE=${{ matrix.sanitize }}
       - name: Build
         run: cmake --build build -j
-      - name: Test
+      - name: Test (unit tests + live cluster smoke test)
         run: ctest --test-dir build --output-on-failure
